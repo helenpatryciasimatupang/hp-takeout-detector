@@ -1,6 +1,6 @@
 /* =========================================================
    HP TAKEOUT DETECTOR
-   FINAL FINAL VERSION (ANTI KOSONG)
+   FINAL VERSION (FOLDER-AWARE)
    ========================================================= */
 
 const $ = (id) => document.getElementById(id);
@@ -11,153 +11,99 @@ function setStatus(msg) {
   $("status").textContent = msg;
 }
 
-/* ===================== READ KMZ / KML ===================== */
-async function readKmzOrKml(file) {
-  const name = file.name.toLowerCase();
-
-  if (name.endsWith(".kml")) return await file.text();
-
-  if (name.endsWith(".kmz")) {
-    const buf = await file.arrayBuffer();
-    const zip = await JSZip.loadAsync(buf);
-    const kmlFileName = Object.keys(zip.files)
-      .find(k => k.toLowerCase().endsWith(".kml"));
-    if (!kmlFileName) throw new Error("KMZ tidak berisi KML");
-    return await zip.files[kmlFileName].async("text");
-  }
-
-  throw new Error("File harus KMZ / KML");
+/* ===================== READ KMZ ===================== */
+async function readKmz(file) {
+  const buf = await file.arrayBuffer();
+  const zip = await JSZip.loadAsync(buf);
+  const kmlFile = Object.keys(zip.files).find(f => f.endsWith(".kml"));
+  if (!kmlFile) throw new Error("KMZ tidak berisi KML");
+  return await zip.files[kmlFile].async("text");
 }
 
-/* ===================== LABEL EXTRACTOR ===================== */
-function extractLabel(feature) {
-  const props = feature.properties || {};
+/* ===================== GET FOLDER PATH ===================== */
+function getFolderPath(node) {
+  let path = [];
+  let cur = node.parentElement;
 
-  // 1️⃣ name
-  if (props.name && props.name.trim()) return props.name.trim();
-
-  // 2️⃣ ExtendedData (GeoJSON flatten)
-  for (const key in props) {
-    if (typeof props[key] === "string" && props[key].trim()) {
-      return props[key].trim();
+  while (cur) {
+    if (cur.tagName === "Folder") {
+      const name = cur.querySelector(":scope > name");
+      if (name) path.unshift(name.textContent.trim().toUpperCase());
     }
+    cur = cur.parentElement;
   }
 
-  // 3️⃣ description (HTML → text)
-  if (props.description) {
-    const div = document.createElement("div");
-    div.innerHTML = props.description;
-    const text = div.textContent.trim();
-    if (text) return text;
-  }
-
-  return "";
+  return path.join("/");
 }
 
-/* ===================== HP FILTER ===================== */
-function isHPLabel(label) {
-  const name = label.toUpperCase();
-
-  // ❌ EXCLUDE INFRA
-  const blacklist = [
-    "FAT","FDT","POLE","TIANG","CLOSURE",
-    "NODE","SPLITTER","ODP","ODC","OLT",
-    "CABINET","BOX","JOINT","HANDHOLE"
-  ];
-  for (const bad of blacklist) {
-    if (name.includes(bad)) return false;
-  }
-
-  // ✅ INCLUDE HP
-  if (
-    name.includes("HOME") ||
-    name.includes("HOMEPASS") ||
-    name.includes("HOME-BIZ")
-  ) return true;
-
-  // Nomor rumah
-  if (/^[0-9]/.test(name)) return true;
-
-  return false;
-}
-
-/* ===================== PARSE HP ===================== */
-function parseKmlHP(kmlText) {
+/* ===================== PARSE HP FROM KML ===================== */
+function parseHPFromKML(kmlText) {
   const dom = new DOMParser().parseFromString(kmlText, "text/xml");
-  const geojson = toGeoJSON.kml(dom);
+  const placemarks = [...dom.getElementsByTagName("Placemark")];
 
-  return (geojson.features || [])
-    .filter(f => f.geometry && f.geometry.type === "Point")
-    .map(f => {
-      const label = extractLabel(f);
-      if (!label) return null;
-      if (!isHPLabel(label)) return null;
+  const results = [];
 
-      const c = f.geometry.coordinates;
-      return {
-        hpId: label,
-        lat: c[1],
-        lon: c[0]
-      };
-    })
-    .filter(Boolean);
+  placemarks.forEach(pm => {
+    const point = pm.getElementsByTagName("Point")[0];
+    if (!point) return;
+
+    const coordText = point.getElementsByTagName("coordinates")[0]?.textContent;
+    if (!coordText) return;
+
+    const [lon, lat] = coordText.trim().split(",").map(Number);
+
+    const name = pm.getElementsByTagName("name")[0]?.textContent.trim() || "";
+
+    const folderPath = getFolderPath(pm);
+
+    const upperPath = folderPath.toUpperCase();
+
+    // 🔥 DEFINISI HP DARI FOLDER
+    const isHP =
+      upperPath.includes("/HP") ||
+      upperPath.endsWith("HP") ||
+      upperPath.includes("/HOME") ||
+      upperPath.includes("/HOME-BIZ");
+
+    if (!isHP) return;
+
+    results.push({
+      hpId: name || "(NO_NAME)",
+      lat,
+      lon,
+      path: folderPath
+    });
+  });
+
+  return results;
 }
 
 /* ===================== DISTANCE ===================== */
-function distM(lat1, lon1, lat2, lon2) {
+function distM(a, b, c, d) {
   const R = 6371000;
-  const toRad = d => d * Math.PI / 180;
-  const dLat = toRad(lat2 - lat1);
-  const dLon = toRad(lon2 - lon1);
-  const a =
+  const toRad = x => x * Math.PI / 180;
+  const dLat = toRad(c - a);
+  const dLon = toRad(d - b);
+  const h =
     Math.sin(dLat/2)**2 +
-    Math.cos(toRad(lat1)) *
-    Math.cos(toRad(lat2)) *
-    Math.sin(dLon/2)**2;
-  return 2 * R * Math.asin(Math.sqrt(a));
-}
-
-/* ===================== INDEX ===================== */
-function indexById(points) {
-  const map = new Map();
-  for (const p of points) {
-    if (!map.has(p.hpId)) map.set(p.hpId, []);
-    map.get(p.hpId).push(p);
-  }
-  return map;
+    Math.cos(toRad(a))*Math.cos(toRad(c))*Math.sin(dLon/2)**2;
+  return 2 * R * Math.asin(Math.sqrt(h));
 }
 
 /* ===================== CSV ===================== */
 function toCsv(rows) {
-  const out = ["HP_ID,Lat,Lon,Status"];
+  const out = ["HP_ID,Lat,Lon,Folder"];
   rows.forEach(r => {
-    out.push(`"${r.hpId}",${r.lat},${r.lon},${r.status}`);
+    out.push(`"${r.hpId}",${r.lat},${r.lon},"${r.path}"`);
   });
   return out.join("\n");
 }
 
 function downloadCsv(name, text) {
-  const blob = new Blob([text], { type: "text/csv" });
   const a = document.createElement("a");
-  a.href = URL.createObjectURL(blob);
+  a.href = URL.createObjectURL(new Blob([text], { type: "text/csv" }));
   a.download = name;
   a.click();
-}
-
-/* ===================== TABLE ===================== */
-function renderTable(rows) {
-  const tb = $("table").querySelector("tbody");
-  tb.innerHTML = "";
-  rows.forEach(r => {
-    tb.insertAdjacentHTML("beforeend", `
-      <tr>
-        <td>${r.hpId}</td>
-        <td>${r.lat.toFixed(7)}</td>
-        <td>${r.lon.toFixed(7)}</td>
-        <td>${r.status}</td>
-      </tr>
-    `);
-  });
 }
 
 /* ===================== MAIN ===================== */
@@ -168,45 +114,35 @@ $("run").addEventListener("click", async () => {
 
   if (!survey || !design) return alert("Upload KMZ Survey & Design");
 
-  setStatus("Parsing KMZ...");
+  setStatus("Parsing KMZ (folder-aware) ...");
+
   const [sKml, dKml] = await Promise.all([
-    readKmzOrKml(survey),
-    readKmzOrKml(design)
+    readKmz(survey),
+    readKmz(design)
   ]);
 
-  const sHP = parseKmlHP(sKml);
-  const dHP = parseKmlHP(dKml);
+  const sHP = parseHPFromKML(sKml);
+  const dHP = parseHPFromKML(dKml);
 
-  const dIndex = indexById(dHP);
-  let mid = 0, mdis = 0;
+  let matched = 0;
   const takeout = [];
 
   for (const hp of sHP) {
-    let found = dIndex.has(hp.hpId);
-
-    if (found) mid++;
+    let found = dHP.some(d => d.hpId === hp.hpId);
 
     if (!found && radius > 0) {
-      for (const d of dHP) {
-        if (distM(hp.lat, hp.lon, d.lat, d.lon) <= radius) {
-          found = true;
-          mdis++;
-          break;
-        }
-      }
+      found = dHP.some(d => distM(hp.lat, hp.lon, d.lat, d.lon) <= radius);
     }
 
-    if (!found) {
-      takeout.push({ ...hp, status: "TAKEOUT" });
-    }
+    if (!found) takeout.push({ ...hp, status: "TAKEOUT" });
+    else matched++;
   }
 
-  renderTable(takeout);
   lastTakeoutRows = takeout;
 
   $("summary").textContent =
     `Survey HP: ${sHP.length} | Design HP: ${dHP.length} | ` +
-    `Matched ID: ${mid} | Matched Dist: ${mdis} | TAKEOUT: ${takeout.length}`;
+    `Matched: ${matched} | TAKEOUT: ${takeout.length}`;
 
   $("download").disabled = takeout.length === 0;
   setStatus("Selesai");
