@@ -1,135 +1,154 @@
-const $ = (id) => document.getElementById(id);
+/* =========================================================
+   HP TAKEOUT DETECTOR
+   FIXED VERSION - HP ONLY
+   ========================================================= */
 
+const $ = (id) => document.getElementById(id);
 let lastTakeoutRows = [];
 
+/* ===================== UTIL ===================== */
 function setStatus(msg) {
   $("status").textContent = msg;
 }
 
-function parseKmlToFeatures(kmlText) {
-  const dom = new DOMParser().parseFromString(kmlText, "text/xml");
-  const gj = toGeoJSON.kml(dom);
-  const feats = (gj.features || []).filter(f => f.geometry && f.geometry.type === "Point");
-  // Normalize: id from name / ExtendedData
-  return feats.map((f, idx) => {
-    const props = f.properties || {};
-    const coords = f.geometry.coordinates; // [lon, lat]
-    const name = (props.name || "").trim();
-    const ext = props || {};
-    // Try common fields
-    const hpId =
-      name ||
-      (ext.HP_ID && String(ext.HP_ID).trim()) ||
-      (ext.hp_id && String(ext.hp_id).trim()) ||
-      (ext.ID && String(ext.ID).trim()) ||
-      "";
-    return {
-      hpId,
-      lat: coords[1],
-      lon: coords[0],
-      props,
-      idx
-    };
-  });
-}
-
+/* ===================== KMZ / KML READER ===================== */
 async function readKmzOrKml(file) {
   const name = file.name.toLowerCase();
+
   if (name.endsWith(".kml")) {
     return await file.text();
   }
+
   if (name.endsWith(".kmz")) {
     const buf = await file.arrayBuffer();
     const zip = await JSZip.loadAsync(buf);
-    // Find first .kml
-    const kmlFileName = Object.keys(zip.files).find(k => k.toLowerCase().endsWith(".kml"));
-    if (!kmlFileName) throw new Error("KMZ tidak berisi file .kml");
+    const kmlFileName = Object.keys(zip.files)
+      .find(k => k.toLowerCase().endsWith(".kml"));
+    if (!kmlFileName) throw new Error("KMZ tidak berisi file KML");
     return await zip.files[kmlFileName].async("text");
   }
-  throw new Error("File harus .kmz atau .kml");
+
+  throw new Error("File harus KMZ / KML");
 }
 
-// Haversine distance in meters
-function distMeters(lat1, lon1, lat2, lon2) {
+/* ===================== HP FILTER (KUNCI) ===================== */
+/*
+  LOGIKA FILTER HP:
+  - Geometry harus POINT
+  - Nama placemark HARUS mengandung HP
+  - Point lain (FAT/FDT/POLE/etc) otomatis diabaikan
+*/
+function isHPFeature(feature) {
+  if (!feature.geometry || feature.geometry.type !== "Point") return false;
+
+  const name = (feature.properties?.name || "").toUpperCase();
+
+  // FILTER KHUSUS HP
+  if (
+    name.startsWith("HP") ||
+    name.includes(" HOME") ||
+    name.includes("HOMEPASS")
+  ) {
+    return true;
+  }
+
+  return false;
+}
+
+/* ===================== PARSE KML ===================== */
+function parseKmlHP(kmlText) {
+  const dom = new DOMParser().parseFromString(kmlText, "text/xml");
+  const geojson = toGeoJSON.kml(dom);
+
+  const features = (geojson.features || [])
+    .filter(isHPFeature)
+    .map((f) => {
+      const coords = f.geometry.coordinates;
+      const name = (f.properties?.name || "").trim();
+
+      return {
+        hpId: name,               // ID UTAMA = NAMA HP
+        lat: coords[1],
+        lon: coords[0]
+      };
+    });
+
+  return features;
+}
+
+/* ===================== DISTANCE ===================== */
+function distanceMeters(lat1, lon1, lat2, lon2) {
   const R = 6371000;
-  const toRad = (d) => d * Math.PI / 180;
+  const toRad = d => d * Math.PI / 180;
   const dLat = toRad(lat2 - lat1);
   const dLon = toRad(lon2 - lon1);
   const a =
-    Math.sin(dLat/2)**2 +
-    Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLon/2)**2;
+    Math.sin(dLat / 2) ** 2 +
+    Math.cos(toRad(lat1)) *
+    Math.cos(toRad(lat2)) *
+    Math.sin(dLon / 2) ** 2;
   return 2 * R * Math.asin(Math.sqrt(a));
 }
 
+/* ===================== INDEX BY ID ===================== */
+function indexById(points) {
+  const map = new Map();
+  for (const p of points) {
+    if (!map.has(p.hpId)) map.set(p.hpId, []);
+    map.get(p.hpId).push(p);
+  }
+  return map;
+}
+
+/* ===================== CSV ===================== */
 function toCsv(rows) {
-  const header = ["HP_ID","Lat","Lon","MatchedBy"];
+  const header = ["HP_ID", "Lat", "Lon", "Status"];
   const lines = [header.join(",")];
+
   for (const r of rows) {
-    const esc = (v) => `"${String(v ?? "").replaceAll('"','""')}"`;
-    lines.push([esc(r.hpId), r.lat, r.lon, esc(r.matchedBy)].join(","));
+    lines.push(
+      `"${r.hpId}",${r.lat},${r.lon},${r.status}`
+    );
   }
   return lines.join("\n");
 }
 
-function downloadText(filename, text) {
+function downloadCsv(filename, text) {
   const blob = new Blob([text], { type: "text/csv;charset=utf-8" });
   const url = URL.createObjectURL(blob);
   const a = document.createElement("a");
   a.href = url;
   a.download = filename;
-  document.body.appendChild(a);
   a.click();
-  a.remove();
   URL.revokeObjectURL(url);
 }
 
+/* ===================== TABLE ===================== */
 function renderTable(rows) {
-  const tb = $("table").querySelector("tbody");
-  tb.innerHTML = "";
-  for (const r of rows.slice(0, 2000)) { // safety cap for UI
+  const tbody = $("table").querySelector("tbody");
+  tbody.innerHTML = "";
+
+  for (const r of rows) {
     const tr = document.createElement("tr");
     tr.innerHTML = `
-      <td>${r.hpId || ""}</td>
-      <td>${Number(r.lat).toFixed(7)}</td>
-      <td>${Number(r.lon).toFixed(7)}</td>
-      <td>${r.matchedBy}</td>
+      <td>${r.hpId}</td>
+      <td>${r.lat.toFixed(7)}</td>
+      <td>${r.lon.toFixed(7)}</td>
+      <td>${r.status}</td>
     `;
-    tb.appendChild(tr);
+    tbody.appendChild(tr);
   }
 }
 
-function makeIndexById(features) {
-  const map = new Map();
-  for (const f of features) {
-    const key = (f.hpId || "").trim();
-    if (!key) continue;
-    if (!map.has(key)) map.set(key, []);
-    map.get(key).push(f);
-  }
-  return map;
-}
-
-function findMatch(surveyPoint, designIdIndex, designPoints, radiusM) {
-  const id = (surveyPoint.hpId || "").trim();
-  if (id && designIdIndex.has(id)) {
-    return { ok: true, matchedBy: "ID" };
-  }
-  // fallback distance search (naive O(n), good enough for few thousands)
-  if (radiusM <= 0) return { ok: false, matchedBy: "NONE" };
-
-  for (const dp of designPoints) {
-    const d = distMeters(surveyPoint.lat, surveyPoint.lon, dp.lat, dp.lon);
-    if (d <= radiusM) return { ok: true, matchedBy: `DIST<=${radiusM}m` };
-  }
-  return { ok: false, matchedBy: "NONE" };
-}
-
+/* ===================== MAIN PROCESS ===================== */
 $("run").addEventListener("click", async () => {
   try {
-    const fSurvey = $("survey").files?.[0];
-    const fDesign = $("design").files?.[0];
-    if (!fSurvey || !fDesign) {
-      alert("Pilih dua file: KMZ Survey & KMZ Design");
+    const surveyFile = $("survey").files[0];
+    const designFile = $("design").files[0];
+    const radius = Number($("radius").value || 0);
+
+    if (!surveyFile || !designFile) {
+      alert("Upload KMZ Survey & KMZ Design");
       return;
     }
 
@@ -137,55 +156,74 @@ $("run").addEventListener("click", async () => {
     $("download").disabled = true;
     lastTakeoutRows = [];
 
-    const radiusM = Number($("radius").value || 0);
-
-    const [kmlSurvey, kmlDesign] = await Promise.all([
-      readKmzOrKml(fSurvey),
-      readKmzOrKml(fDesign)
+    const [surveyKml, designKml] = await Promise.all([
+      readKmzOrKml(surveyFile),
+      readKmzOrKml(designFile)
     ]);
 
-    setStatus("Parsing KML → Point features...");
-    const surveyPts = parseKmlToFeatures(kmlSurvey);
-    const designPts = parseKmlToFeatures(kmlDesign);
+    setStatus("Parsing HP saja...");
+    const surveyHP = parseKmlHP(surveyKml);
+    const designHP = parseKmlHP(designKml);
 
-    const designIndex = makeIndexById(designPts);
+    const designIndex = indexById(designHP);
 
-    setStatus("Mencari TAKEOUT...");
-    const takeouts = [];
-    let matchedId = 0, matchedDist = 0, unmatched = 0;
+    let matchId = 0;
+    let matchDist = 0;
+    let takeout = [];
 
-    for (const sp of surveyPts) {
-      const res = findMatch(sp, designIndex, designPts, radiusM);
-      if (res.ok) {
-        if (res.matchedBy === "ID") matchedId++;
-        else matchedDist++;
-      } else {
-        unmatched++;
-        takeouts.push({
-          hpId: sp.hpId,
-          lat: sp.lat,
-          lon: sp.lon,
-          matchedBy: "TAKEOUT"
+    for (const hp of surveyHP) {
+      let found = false;
+
+      // MATCH BY ID
+      if (designIndex.has(hp.hpId)) {
+        matchId++;
+        found = true;
+      }
+
+      // FALLBACK BY DISTANCE
+      if (!found && radius > 0) {
+        for (const d of designHP) {
+          const dist = distanceMeters(hp.lat, hp.lon, d.lat, d.lon);
+          if (dist <= radius) {
+            matchDist++;
+            found = true;
+            break;
+          }
+        }
+      }
+
+      if (!found) {
+        takeout.push({
+          hpId: hp.hpId,
+          lat: hp.lat,
+          lon: hp.lon,
+          status: "TAKEOUT"
         });
       }
     }
 
-    lastTakeoutRows = takeouts;
-    renderTable(takeouts);
+    lastTakeoutRows = takeout;
+    renderTable(takeout);
 
     $("summary").textContent =
-      `Survey points: ${surveyPts.length} | Design points: ${designPts.length} | Matched by ID: ${matchedId} | Matched by distance: ${matchedDist} | TAKEOUT: ${unmatched}`;
+      `Survey HP: ${surveyHP.length} | ` +
+      `Design HP: ${designHP.length} | ` +
+      `Matched by ID: ${matchId} | ` +
+      `Matched by Distance: ${matchDist} | ` +
+      `TAKEOUT: ${takeout.length}`;
 
+    $("download").disabled = takeout.length === 0;
     setStatus("Selesai.");
-    $("download").disabled = takeouts.length === 0;
+
   } catch (err) {
     console.error(err);
-    setStatus(`Error: ${err.message || err}`);
-    alert(`Error: ${err.message || err}`);
+    alert(err.message || err);
+    setStatus("Error");
   }
 });
 
+/* ===================== DOWNLOAD ===================== */
 $("download").addEventListener("click", () => {
   const csv = toCsv(lastTakeoutRows);
-  downloadText("hp_takeout.csv", csv);
+  downloadCsv("hp_takeout.csv", csv);
 });
