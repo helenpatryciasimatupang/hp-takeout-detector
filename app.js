@@ -1,17 +1,17 @@
 /* =========================================================
    HP TAKEOUT DETECTOR
-   FIXED VERSION - HP ONLY
+   FINAL VERSION - HP ONLY
    ========================================================= */
 
 const $ = (id) => document.getElementById(id);
 let lastTakeoutRows = [];
 
-/* ===================== UTIL ===================== */
+/* ===================== STATUS ===================== */
 function setStatus(msg) {
   $("status").textContent = msg;
 }
 
-/* ===================== KMZ / KML READER ===================== */
+/* ===================== READ KMZ / KML ===================== */
 async function readKmzOrKml(file) {
   const name = file.name.toLowerCase();
 
@@ -24,73 +24,102 @@ async function readKmzOrKml(file) {
     const zip = await JSZip.loadAsync(buf);
     const kmlFileName = Object.keys(zip.files)
       .find(k => k.toLowerCase().endsWith(".kml"));
+
     if (!kmlFileName) throw new Error("KMZ tidak berisi file KML");
+
     return await zip.files[kmlFileName].async("text");
   }
 
-  throw new Error("File harus KMZ / KML");
+  throw new Error("File harus KMZ atau KML");
 }
 
-/* ===================== HP FILTER (KUNCI) ===================== */
+/* ===================== HP FILTER (FINAL RULE) ===================== */
 /*
-  LOGIKA FILTER HP:
-  - Geometry harus POINT
-  - Nama placemark HARUS mengandung HP
-  - Point lain (FAT/FDT/POLE/etc) otomatis diabaikan
+  HP JIKA:
+  - POINT
+  - DAN (mengandung HOME / HOMEPASS / HOME-BIZ)
+    ATAU
+  - Nama diawali angka (nomor rumah)
+
+  BUKAN HP JIKA:
+  - FAT / FDT / POLE / TIANG / CLOSURE / NODE / SPLITTER / dll
 */
 function isHPFeature(feature) {
   if (!feature.geometry || feature.geometry.type !== "Point") return false;
 
-  const name = (feature.properties?.name || "").toUpperCase();
+  const name = (feature.properties?.name || "").trim().toUpperCase();
+  if (!name) return false;
 
-  // FILTER KHUSUS HP
-  if (
-    name.startsWith("HP") ||
-    name.includes(" HOME") ||
-    name.includes("HOMEPASS")
-  ) {
-    return true;
+  // ❌ EXCLUDE NON-HP
+  const blacklist = [
+    "FAT",
+    "FDT",
+    "POLE",
+    "TIANG",
+    "CLOSURE",
+    "NODE",
+    "SPLITTER",
+    "ODP",
+    "ODC",
+    "OLT",
+    "CABINET",
+    "BOX",
+    "JOINT",
+    "HANDHOLE"
+  ];
+
+  for (const bad of blacklist) {
+    if (name.includes(bad)) return false;
   }
 
-  return false;
+  // ✅ INCLUDE HP
+  const isHomeKeyword =
+    name.includes("HOME") ||
+    name.includes("HOMEPASS") ||
+    name.includes("HOME-BIZ");
+
+  const isHouseNumber = /^[0-9]/.test(name);
+
+  return isHomeKeyword || isHouseNumber;
 }
 
-/* ===================== PARSE KML ===================== */
+/* ===================== PARSE KML (HP ONLY) ===================== */
 function parseKmlHP(kmlText) {
   const dom = new DOMParser().parseFromString(kmlText, "text/xml");
   const geojson = toGeoJSON.kml(dom);
 
-  const features = (geojson.features || [])
+  return (geojson.features || [])
     .filter(isHPFeature)
-    .map((f) => {
+    .map(f => {
       const coords = f.geometry.coordinates;
       const name = (f.properties?.name || "").trim();
 
       return {
-        hpId: name,               // ID UTAMA = NAMA HP
+        hpId: name,        // ID UTAMA = NAMA
         lat: coords[1],
         lon: coords[0]
       };
     });
-
-  return features;
 }
 
 /* ===================== DISTANCE ===================== */
 function distanceMeters(lat1, lon1, lat2, lon2) {
   const R = 6371000;
   const toRad = d => d * Math.PI / 180;
+
   const dLat = toRad(lat2 - lat1);
   const dLon = toRad(lon2 - lon1);
+
   const a =
     Math.sin(dLat / 2) ** 2 +
     Math.cos(toRad(lat1)) *
     Math.cos(toRad(lat2)) *
     Math.sin(dLon / 2) ** 2;
+
   return 2 * R * Math.asin(Math.sqrt(a));
 }
 
-/* ===================== INDEX BY ID ===================== */
+/* ===================== INDEX DESIGN BY ID ===================== */
 function indexById(points) {
   const map = new Map();
   for (const p of points) {
@@ -148,7 +177,7 @@ $("run").addEventListener("click", async () => {
     const radius = Number($("radius").value || 0);
 
     if (!surveyFile || !designFile) {
-      alert("Upload KMZ Survey & KMZ Design");
+      alert("Upload KMZ Survey dan KMZ Design");
       return;
     }
 
@@ -169,7 +198,7 @@ $("run").addEventListener("click", async () => {
 
     let matchId = 0;
     let matchDist = 0;
-    let takeout = [];
+    const takeout = [];
 
     for (const hp of surveyHP) {
       let found = false;
@@ -183,8 +212,7 @@ $("run").addEventListener("click", async () => {
       // FALLBACK BY DISTANCE
       if (!found && radius > 0) {
         for (const d of designHP) {
-          const dist = distanceMeters(hp.lat, hp.lon, d.lat, d.lon);
-          if (dist <= radius) {
+          if (distanceMeters(hp.lat, hp.lon, d.lat, d.lon) <= radius) {
             matchDist++;
             found = true;
             break;
