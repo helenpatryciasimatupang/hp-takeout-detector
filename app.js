@@ -1,6 +1,6 @@
 /* =========================================================
    HP TAKEOUT DETECTOR
-   FINAL VERSION - HP ONLY
+   FINAL FINAL VERSION (ANTI KOSONG)
    ========================================================= */
 
 const $ = (id) => document.getElementById(id);
@@ -15,111 +15,109 @@ function setStatus(msg) {
 async function readKmzOrKml(file) {
   const name = file.name.toLowerCase();
 
-  if (name.endsWith(".kml")) {
-    return await file.text();
-  }
+  if (name.endsWith(".kml")) return await file.text();
 
   if (name.endsWith(".kmz")) {
     const buf = await file.arrayBuffer();
     const zip = await JSZip.loadAsync(buf);
     const kmlFileName = Object.keys(zip.files)
       .find(k => k.toLowerCase().endsWith(".kml"));
-
-    if (!kmlFileName) throw new Error("KMZ tidak berisi file KML");
-
+    if (!kmlFileName) throw new Error("KMZ tidak berisi KML");
     return await zip.files[kmlFileName].async("text");
   }
 
-  throw new Error("File harus KMZ atau KML");
+  throw new Error("File harus KMZ / KML");
 }
 
-/* ===================== HP FILTER (FINAL RULE) ===================== */
-/*
-  HP JIKA:
-  - POINT
-  - DAN (mengandung HOME / HOMEPASS / HOME-BIZ)
-    ATAU
-  - Nama diawali angka (nomor rumah)
+/* ===================== LABEL EXTRACTOR ===================== */
+function extractLabel(feature) {
+  const props = feature.properties || {};
 
-  BUKAN HP JIKA:
-  - FAT / FDT / POLE / TIANG / CLOSURE / NODE / SPLITTER / dll
-*/
-function isHPFeature(feature) {
-  if (!feature.geometry || feature.geometry.type !== "Point") return false;
+  // 1️⃣ name
+  if (props.name && props.name.trim()) return props.name.trim();
 
-  const name = (feature.properties?.name || "").trim().toUpperCase();
-  if (!name) return false;
+  // 2️⃣ ExtendedData (GeoJSON flatten)
+  for (const key in props) {
+    if (typeof props[key] === "string" && props[key].trim()) {
+      return props[key].trim();
+    }
+  }
 
-  // ❌ EXCLUDE NON-HP
+  // 3️⃣ description (HTML → text)
+  if (props.description) {
+    const div = document.createElement("div");
+    div.innerHTML = props.description;
+    const text = div.textContent.trim();
+    if (text) return text;
+  }
+
+  return "";
+}
+
+/* ===================== HP FILTER ===================== */
+function isHPLabel(label) {
+  const name = label.toUpperCase();
+
+  // ❌ EXCLUDE INFRA
   const blacklist = [
-    "FAT",
-    "FDT",
-    "POLE",
-    "TIANG",
-    "CLOSURE",
-    "NODE",
-    "SPLITTER",
-    "ODP",
-    "ODC",
-    "OLT",
-    "CABINET",
-    "BOX",
-    "JOINT",
-    "HANDHOLE"
+    "FAT","FDT","POLE","TIANG","CLOSURE",
+    "NODE","SPLITTER","ODP","ODC","OLT",
+    "CABINET","BOX","JOINT","HANDHOLE"
   ];
-
   for (const bad of blacklist) {
     if (name.includes(bad)) return false;
   }
 
   // ✅ INCLUDE HP
-  const isHomeKeyword =
+  if (
     name.includes("HOME") ||
     name.includes("HOMEPASS") ||
-    name.includes("HOME-BIZ");
+    name.includes("HOME-BIZ")
+  ) return true;
 
-  const isHouseNumber = /^[0-9]/.test(name);
+  // Nomor rumah
+  if (/^[0-9]/.test(name)) return true;
 
-  return isHomeKeyword || isHouseNumber;
+  return false;
 }
 
-/* ===================== PARSE KML (HP ONLY) ===================== */
+/* ===================== PARSE HP ===================== */
 function parseKmlHP(kmlText) {
   const dom = new DOMParser().parseFromString(kmlText, "text/xml");
   const geojson = toGeoJSON.kml(dom);
 
   return (geojson.features || [])
-    .filter(isHPFeature)
+    .filter(f => f.geometry && f.geometry.type === "Point")
     .map(f => {
-      const coords = f.geometry.coordinates;
-      const name = (f.properties?.name || "").trim();
+      const label = extractLabel(f);
+      if (!label) return null;
+      if (!isHPLabel(label)) return null;
 
+      const c = f.geometry.coordinates;
       return {
-        hpId: name,        // ID UTAMA = NAMA
-        lat: coords[1],
-        lon: coords[0]
+        hpId: label,
+        lat: c[1],
+        lon: c[0]
       };
-    });
+    })
+    .filter(Boolean);
 }
 
 /* ===================== DISTANCE ===================== */
-function distanceMeters(lat1, lon1, lat2, lon2) {
+function distM(lat1, lon1, lat2, lon2) {
   const R = 6371000;
   const toRad = d => d * Math.PI / 180;
-
   const dLat = toRad(lat2 - lat1);
   const dLon = toRad(lon2 - lon1);
-
   const a =
-    Math.sin(dLat / 2) ** 2 +
+    Math.sin(dLat/2)**2 +
     Math.cos(toRad(lat1)) *
     Math.cos(toRad(lat2)) *
-    Math.sin(dLon / 2) ** 2;
-
+    Math.sin(dLon/2)**2;
   return 2 * R * Math.asin(Math.sqrt(a));
 }
 
-/* ===================== INDEX DESIGN BY ID ===================== */
+/* ===================== INDEX ===================== */
 function indexById(points) {
   const map = new Map();
   for (const p of points) {
@@ -131,127 +129,89 @@ function indexById(points) {
 
 /* ===================== CSV ===================== */
 function toCsv(rows) {
-  const header = ["HP_ID", "Lat", "Lon", "Status"];
-  const lines = [header.join(",")];
-
-  for (const r of rows) {
-    lines.push(
-      `"${r.hpId}",${r.lat},${r.lon},${r.status}`
-    );
-  }
-  return lines.join("\n");
+  const out = ["HP_ID,Lat,Lon,Status"];
+  rows.forEach(r => {
+    out.push(`"${r.hpId}",${r.lat},${r.lon},${r.status}`);
+  });
+  return out.join("\n");
 }
 
-function downloadCsv(filename, text) {
-  const blob = new Blob([text], { type: "text/csv;charset=utf-8" });
-  const url = URL.createObjectURL(blob);
+function downloadCsv(name, text) {
+  const blob = new Blob([text], { type: "text/csv" });
   const a = document.createElement("a");
-  a.href = url;
-  a.download = filename;
+  a.href = URL.createObjectURL(blob);
+  a.download = name;
   a.click();
-  URL.revokeObjectURL(url);
 }
 
 /* ===================== TABLE ===================== */
 function renderTable(rows) {
-  const tbody = $("table").querySelector("tbody");
-  tbody.innerHTML = "";
-
-  for (const r of rows) {
-    const tr = document.createElement("tr");
-    tr.innerHTML = `
-      <td>${r.hpId}</td>
-      <td>${r.lat.toFixed(7)}</td>
-      <td>${r.lon.toFixed(7)}</td>
-      <td>${r.status}</td>
-    `;
-    tbody.appendChild(tr);
-  }
+  const tb = $("table").querySelector("tbody");
+  tb.innerHTML = "";
+  rows.forEach(r => {
+    tb.insertAdjacentHTML("beforeend", `
+      <tr>
+        <td>${r.hpId}</td>
+        <td>${r.lat.toFixed(7)}</td>
+        <td>${r.lon.toFixed(7)}</td>
+        <td>${r.status}</td>
+      </tr>
+    `);
+  });
 }
 
-/* ===================== MAIN PROCESS ===================== */
+/* ===================== MAIN ===================== */
 $("run").addEventListener("click", async () => {
-  try {
-    const surveyFile = $("survey").files[0];
-    const designFile = $("design").files[0];
-    const radius = Number($("radius").value || 0);
+  const survey = $("survey").files[0];
+  const design = $("design").files[0];
+  const radius = Number($("radius").value || 0);
 
-    if (!surveyFile || !designFile) {
-      alert("Upload KMZ Survey dan KMZ Design");
-      return;
-    }
+  if (!survey || !design) return alert("Upload KMZ Survey & Design");
 
-    setStatus("Membaca file...");
-    $("download").disabled = true;
-    lastTakeoutRows = [];
+  setStatus("Parsing KMZ...");
+  const [sKml, dKml] = await Promise.all([
+    readKmzOrKml(survey),
+    readKmzOrKml(design)
+  ]);
 
-    const [surveyKml, designKml] = await Promise.all([
-      readKmzOrKml(surveyFile),
-      readKmzOrKml(designFile)
-    ]);
+  const sHP = parseKmlHP(sKml);
+  const dHP = parseKmlHP(dKml);
 
-    setStatus("Parsing HP saja...");
-    const surveyHP = parseKmlHP(surveyKml);
-    const designHP = parseKmlHP(designKml);
+  const dIndex = indexById(dHP);
+  let mid = 0, mdis = 0;
+  const takeout = [];
 
-    const designIndex = indexById(designHP);
+  for (const hp of sHP) {
+    let found = dIndex.has(hp.hpId);
 
-    let matchId = 0;
-    let matchDist = 0;
-    const takeout = [];
+    if (found) mid++;
 
-    for (const hp of surveyHP) {
-      let found = false;
-
-      // MATCH BY ID
-      if (designIndex.has(hp.hpId)) {
-        matchId++;
-        found = true;
-      }
-
-      // FALLBACK BY DISTANCE
-      if (!found && radius > 0) {
-        for (const d of designHP) {
-          if (distanceMeters(hp.lat, hp.lon, d.lat, d.lon) <= radius) {
-            matchDist++;
-            found = true;
-            break;
-          }
+    if (!found && radius > 0) {
+      for (const d of dHP) {
+        if (distM(hp.lat, hp.lon, d.lat, d.lon) <= radius) {
+          found = true;
+          mdis++;
+          break;
         }
       }
-
-      if (!found) {
-        takeout.push({
-          hpId: hp.hpId,
-          lat: hp.lat,
-          lon: hp.lon,
-          status: "TAKEOUT"
-        });
-      }
     }
 
-    lastTakeoutRows = takeout;
-    renderTable(takeout);
-
-    $("summary").textContent =
-      `Survey HP: ${surveyHP.length} | ` +
-      `Design HP: ${designHP.length} | ` +
-      `Matched by ID: ${matchId} | ` +
-      `Matched by Distance: ${matchDist} | ` +
-      `TAKEOUT: ${takeout.length}`;
-
-    $("download").disabled = takeout.length === 0;
-    setStatus("Selesai.");
-
-  } catch (err) {
-    console.error(err);
-    alert(err.message || err);
-    setStatus("Error");
+    if (!found) {
+      takeout.push({ ...hp, status: "TAKEOUT" });
+    }
   }
+
+  renderTable(takeout);
+  lastTakeoutRows = takeout;
+
+  $("summary").textContent =
+    `Survey HP: ${sHP.length} | Design HP: ${dHP.length} | ` +
+    `Matched ID: ${mid} | Matched Dist: ${mdis} | TAKEOUT: ${takeout.length}`;
+
+  $("download").disabled = takeout.length === 0;
+  setStatus("Selesai");
 });
 
-/* ===================== DOWNLOAD ===================== */
 $("download").addEventListener("click", () => {
-  const csv = toCsv(lastTakeoutRows);
-  downloadCsv("hp_takeout.csv", csv);
+  downloadCsv("hp_takeout.csv", toCsv(lastTakeoutRows));
 });
